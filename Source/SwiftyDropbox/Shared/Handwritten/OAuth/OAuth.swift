@@ -5,13 +5,15 @@
 import SystemConfiguration
 import Foundation
 
-public protocol SharedApplication {
+public protocol SharedApplication: class {
     func presentErrorMessage(_ message: String, title: String)
     func presentErrorMessageWithHandlers(_ message: String, title: String, buttonHandlers: Dictionary<String, () -> Void>)
     func presentPlatformSpecificAuth(_ authURL: URL) -> Bool
     func presentAuthChannel(_ authURL: URL, tryIntercept: @escaping ((URL) -> Bool), cancelHandler: @escaping (() -> Void))
     func presentExternalApp(_ url: URL)
     func canPresentExternalApp(_ url: URL) -> Bool
+    func presentLoading()
+    func dismissLoading()
 }
 
 public typealias DropboxOAuthCompletion = (DropboxOAuthResult?) -> Void
@@ -31,6 +33,7 @@ open class DropboxOAuthManager {
     /// Session data for OAuth2 code flow with PKCE.
     /// nil if we are in the legacy token flow.
     var authSession: AuthSession?
+    weak var sharedApplication: SharedApplication?
 
     private var localeIdentifier: String {
         return locale?.identifier ?? (Bundle.main.preferredLocalizations.first ?? "en")
@@ -126,6 +129,7 @@ open class DropboxOAuthManager {
         } else {
             authSession = nil
         }
+        self.sharedApplication = sharedApplication
 
         let url = self.authURL()
 
@@ -244,11 +248,15 @@ open class DropboxOAuthManager {
     }
 
     func finishPkceOAuth(authCode: String, codeVerifier: String, completion: @escaping DropboxOAuthCompletion) {
+        sharedApplication?.presentLoading()
         let request = OAuthTokenExchangeRequest(
             oauthCode: authCode, codeVerifier: codeVerifier,
             appKey: appKey, locale: localeIdentifier, redirectUri: redirectURL.absoluteString
         )
-        request.start(completion: completion)
+        request.start { [weak sharedApplication] in
+            sharedApplication?.dismissLoading()
+            completion($0)
+        }
     }
 
     func checkAndPresentPlatformSpecificAuth(_ sharedApplication: SharedApplication) -> Bool {

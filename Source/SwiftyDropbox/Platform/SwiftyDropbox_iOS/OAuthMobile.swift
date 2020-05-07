@@ -7,6 +7,15 @@ import SafariServices
 import UIKit
 import WebKit
 
+/// Protocol for handling loading status during auth flow.
+/// Implementing class could show custom UX to reflect loading status.
+public protocol LoadingStatusDelegate: class {
+    // Called when auth flow is loading/waiting for some data. e.g. Waiting for a network request to finish.
+    func showLoading()
+    // Called when auth flow finishes loading/waiting. e.g. A network request finished.
+    func dismissLoading()
+}
+
 extension DropboxClientsManager {
     /// Starts a "token" flow.
     ///
@@ -32,13 +41,17 @@ extension DropboxClientsManager {
     /// - Parameters:
     ///     - sharedApplication: The shared UIApplication instance in your app.
     ///     - controller: A UIViewController to present the auth flow from.
+    ///     - loadingStatusDelegate: An optional delegate to handle loading experience during auth flow.
+    ///       e.g. Show a looading spinner and block user interaction while loading/waiting.
+    ///       If a delegate is not provided, the SDK will show a default loading spinner when necessary.
     ///     - openURL: Handler to open a URL.
     ///     - scopeRequest: Contains requested scopes to obtain.
     public static func authorizeFromControllerV2(
-        _ sharedApplication: UIApplication, controller: UIViewController?, openURL: @escaping ((URL) -> Void), scopeRequest: ScopeRequest?
+        _ sharedApplication: UIApplication, controller: UIViewController?, loadingStatusDelegate: LoadingStatusDelegate?, openURL: @escaping ((URL) -> Void), scopeRequest: ScopeRequest?
     ) {
         precondition(DropboxOAuthManager.sharedOAuthManager != nil, "Call `DropboxClientsManager.setupWithAppKey` or `DropboxClientsManager.setupWithTeamAppKey` before calling this method")
         let sharedMobileApplication = MobileSharedApplication(sharedApplication: sharedApplication, controller: controller, openURL: openURL)
+        sharedMobileApplication.loadingStatusDelegate = loadingStatusDelegate
         MobileSharedApplication.sharedMobileApplication = sharedMobileApplication
         DropboxOAuthManager.sharedOAuthManager.authorizeFromSharedApplication(sharedMobileApplication, usePKCE: true, scopeRequest: scopeRequest)
     }
@@ -251,6 +264,8 @@ open class MobileSharedApplication: SharedApplication {
     let controller: UIViewController?
     let openURL: ((URL) -> Void)
 
+    weak var loadingStatusDelegate: LoadingStatusDelegate?
+
     public init(sharedApplication: UIApplication, controller: UIViewController?, openURL: @escaping ((URL) -> Void)) {
         // fields saved for app-extension safety
         self.sharedApplication = sharedApplication
@@ -317,6 +332,33 @@ open class MobileSharedApplication: SharedApplication {
                 if presentedViewController.isBeingDismissed == false && presentedViewController is MobileSafariViewController {
                     controller.dismiss(animated: true, completion: nil)
                 }
+            }
+        }
+    }
+
+    public func presentLoading() {
+        if let safariViewController = controller?.presentedViewController as? MobileSafariViewController {
+            // Web OAuth flow, present the spinner over the MobileSafariViewController.
+            safariViewController.present(LoadingViewController(nibName: nil, bundle: nil), animated: false)
+        } else {
+            if let loadingStatusDelegate = loadingStatusDelegate {
+                loadingStatusDelegate.showLoading()
+            } else {
+                controller?.present(LoadingViewController(nibName: nil, bundle: nil), animated: false)
+            }
+        }
+    }
+
+    public func dismissLoading() {
+        if let safariViewController = controller?.presentedViewController as? MobileSafariViewController,
+            let loadingView = safariViewController.presentedViewController as? LoadingViewController {
+            // Web OAuth flow, dismiss loading view on the MobileSafariViewController.
+            loadingView.dismiss(animated: false)
+        } else {
+            if let loadingStatusDelegate = loadingStatusDelegate {
+                loadingStatusDelegate.dismissLoading()
+            } else if let loadingView = controller?.presentedViewController as? LoadingViewController {
+                loadingView.dismiss(animated: false)
             }
         }
     }
