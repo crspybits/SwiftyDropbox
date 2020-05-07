@@ -14,6 +14,8 @@ public protocol SharedApplication {
     func canPresentExternalApp(_ url: URL) -> Bool
 }
 
+public typealias DropboxOAuthCompletion = (DropboxOAuthResult?) -> Void
+
 /// Manages access token storage and authentication
 ///
 /// Use the `DropboxOAuthManager` to authenticate users through OAuth2, save access tokens, and retrieve access tokens.
@@ -29,6 +31,10 @@ open class DropboxOAuthManager {
     /// Session data for OAuth2 code flow with PKCE.
     /// nil if we are in the legacy token flow.
     var authSession: AuthSession?
+
+    private var localeIdentifier: String {
+        return locale?.identifier ?? (Bundle.main.preferredLocalizations.first ?? "en")
+    }
 
     // MARK: Shared instance
     /// A shared instance of a `DropboxOAuthManager` for convenience
@@ -58,24 +64,24 @@ open class DropboxOAuthManager {
     ///
     /// - returns `nil` if SwiftyDropbox cannot handle the redirect URL, otherwise returns the `DropboxOAuthResult`.
     ///
-    open func handleRedirectURL(_ url: URL) -> DropboxOAuthResult? {
+    open func handleRedirectURL(_ url: URL, completion: @escaping DropboxOAuthCompletion) {
         // check if url is a cancel url
         if (url.host == "1" && url.path == "/cancel") || (url.host == "2" && url.path == "/cancel") {
-            return .cancel
-        }
-
-        if !self.canHandleURL(url) {
-            return nil
-        }
-
-        let result = extractFromUrl(url)
-
-        switch result {
-        case .success(let token):
-            _ = Keychain.set(token.uid, value: token.accessToken)
-            return result
-        default:
-            return result
+            completion(.cancel)
+        } else if !self.canHandleURL(url) {
+            completion(nil)
+        } else {
+            extractFromUrl(url) { result in
+                if let result = result {
+                    switch result {
+                    case .success(let token):
+                        _ = self.storeAccessToken(token)
+                    default:
+                        break
+                    }
+                }
+                completion(result)
+            }
         }
     }
 
@@ -157,15 +163,13 @@ open class DropboxOAuthManager {
     func authURL() -> URL {
         var components = URLComponents()
         components.scheme = "https"
-        components.host = self.host
+        components.host = host
         components.path = "/oauth2/authorize"
 
-        let locale = Bundle.main.preferredLocalizations.first ?? "en"
-
         var params = [
-            URLQueryItem(name: "client_id", value: self.appKey),
-            URLQueryItem(name: "redirect_uri", value: self.redirectURL.absoluteString),
-            URLQueryItem(name: "locale", value: self.locale?.identifier ?? locale),
+            URLQueryItem(name: "client_id", value: appKey),
+            URLQueryItem(name: "redirect_uri", value: redirectURL.absoluteString),
+            URLQueryItem(name: "locale", value: localeIdentifier),
             URLQueryItem(name: "disable_signup", value: "true"),
         ]
 
@@ -196,39 +200,55 @@ open class DropboxOAuthManager {
         return false
     }
 
-    func extractFromRedirectURL(_ url: URL) -> DropboxOAuthResult {
-        var results = [String: String]()
-        let pairs  = url.fragment?.components(separatedBy: "&") ?? []
-
-        for pair in pairs {
-            let kv = pair.components(separatedBy: "=")
-            results.updateValue(kv[1], forKey: kv[0])
-        }
-
+    func extractFromRedirectURL(_ url: URL, completion: @escaping DropboxOAuthCompletion) {
+        let results = OAuthUtils.extractParamsFromUrl(url)
         if let error = results["error"] {
-            let desc = results["error_description"]?.replacingOccurrences(of: "+", with: " ").removingPercentEncoding
-            if results["error"] != "access_denied" {
-                return .cancel
+            let result: DropboxOAuthResult
+            let desc = results[OAuthConstants.errorDescription]?
+                .replacingOccurrences(of: "+", with: " ")
+                .removingPercentEncoding
+            if results[OAuthConstants.errorKey] != "access_denied" {
+                result = .cancel
+            } else {
+                result = .error(OAuth2Error(errorCode: error), desc ?? "")
             }
-            return .error(OAuth2Error(errorCode: error), desc ?? "")
+            completion(result)
         } else {
-            let state = results["state"]
+            let state = results[OAuthConstants.stateKey]
             let storedState = UserDefaults.standard.string(forKey: Constants.kCSRFKey)
 
             if state == nil || storedState == nil || state != storedState {
-                return .error(OAuth2Error(errorCode: "inconsistent_state"), "Auth flow failed because of inconsistent state.")
+                completion(.error(
+                    OAuth2Error(errorCode: "inconsistent_state"), "Auth flow failed because of inconsistent state.")
+                )
             } else {
                 // reset upon success
                 UserDefaults.standard.setValue(nil, forKey: Constants.kCSRFKey)
+                if let authSession = authSession, let authCode = results["code"] {
+                    // Code flow.
+                    finishPkceOAuth(
+                        authCode: authCode, codeVerifier: authSession.pkceData.codeVerifier, completion: completion
+                    )
+                } else if let accessToken = results["access_token"], let uid = results[OAuthConstants.uidKey] {
+                    // Token flow.
+                    completion(.success(DropboxAccessToken(accessToken: accessToken, uid: uid)))
+                } else {
+                    completion(.error(.unknown, "Invalid response."))
+                }
             }
-            let accessToken = results["access_token"]!
-            let uid = results["uid"]!
-            return .success(DropboxAccessToken(accessToken: accessToken, uid: uid))
         }
     }
 
-    func extractFromUrl(_ url: URL) -> DropboxOAuthResult {
-        return extractFromRedirectURL(url)
+    func extractFromUrl(_ url: URL, completion: @escaping DropboxOAuthCompletion) {
+        return extractFromRedirectURL(url, completion: completion)
+    }
+
+    func finishPkceOAuth(authCode: String, codeVerifier: String, completion: @escaping DropboxOAuthCompletion) {
+        let request = OAuthTokenExchangeRequest(
+            oauthCode: authCode, codeVerifier: codeVerifier,
+            appKey: appKey, locale: localeIdentifier, redirectUri: redirectURL.absoluteString
+        )
+        request.start(completion: completion)
     }
 
     func checkAndPresentPlatformSpecificAuth(_ sharedApplication: SharedApplication) -> Bool {
@@ -245,7 +265,7 @@ open class DropboxOAuthManager {
         var ret = [String : DropboxAccessToken]()
         for user in users {
             if let accessToken = Keychain.get(user) {
-                ret[user] = DropboxAccessToken(accessToken: accessToken, uid: user)
+                ret[user] = accessToken
             }
         }
         return ret
@@ -269,9 +289,7 @@ open class DropboxOAuthManager {
     ///
     open func getAccessToken(_ user: String?) -> DropboxAccessToken? {
         if let user = user {
-            if let accessToken = Keychain.get(user) {
-                return DropboxAccessToken(accessToken: accessToken, uid: user)
-            }
+            return Keychain.get(user)
         }
         return nil
     }
@@ -304,7 +322,13 @@ open class DropboxOAuthManager {
     /// - returns: whether the operation succeeded
     ///
     open func storeAccessToken(_ token: DropboxAccessToken) -> Bool {
-        return Keychain.set(token.uid, value: token.accessToken)
+        do {
+            let jsonEncoder = JSONEncoder()
+            let data = try jsonEncoder.encode(token)
+            return Keychain.set(token.uid, value: data)
+        } catch {
+            return false
+        }
     }
 
     ///
@@ -318,17 +342,35 @@ open class DropboxOAuthManager {
 }
 
 /// A Dropbox access token
-open class DropboxAccessToken: CustomStringConvertible {
+open class DropboxAccessToken: CustomStringConvertible, Codable {
 
-    /// The access token string
+    /// The access token string.
     public let accessToken: String
 
-    /// The associated user
+    /// The associated user id.
     public let uid: String
 
-    public init(accessToken: String, uid: String) {
+    /// The refresh token if accessToken is short-lived.
+    public let refreshToken: String?
+
+    /// The expiration time of the (short-lived) accessToken.
+    public let tokenExpirationTimestamp: TimeInterval?
+
+    /// Designated Initializer
+    ///
+    /// - parameters:
+    ///     - accessToken: The access token string.
+    ///     - uid: The associated user id.
+    ///     - refreshToken: The refresh token if accessToken is short-lived.
+    ///     - tokenExpirationTimestamp: The expiration time of the (short-lived) accessToken.
+    init(
+        accessToken: String, uid: String,
+        refreshToken: String? = nil, tokenExpirationTimestamp: TimeInterval? = nil
+    ) {
         self.accessToken = accessToken
         self.uid = uid
+        self.refreshToken = refreshToken
+        self.tokenExpirationTimestamp = tokenExpirationTimestamp
     }
 
     open var description: String {
@@ -461,11 +503,19 @@ class Keychain {
         return []
     }
 
-
-
-    class func get(_ key: String) -> String? {
+    class func get(_ key: String) -> DropboxAccessToken? {
         if let data = getAsData(key) {
-            return String(data: data, encoding: .utf8)
+            do {
+                let jsonDecoder = JSONDecoder()
+                return try jsonDecoder.decode(DropboxAccessToken.self, from: data)
+            } catch {
+                // The token might be stored as a string by a previous version of SDK.
+                if let accessTokenString = String(data: data, encoding: .utf8) {
+                    return DropboxAccessToken(accessToken: accessTokenString, uid: key)
+                } else {
+                    return nil
+                }
+            }
         } else {
             return nil
         }
